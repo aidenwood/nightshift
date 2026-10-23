@@ -1,0 +1,5 @@
+[
+  { "id": "offline-maps",  "task": "offline hiking maps",      "angle": "what actually breaks when you lose signal" },
+  { "id": "grade-system",  "task": "australian walk grading",  "angle": "what grade 4 means in practice" },
+  { "id": "water-on-trail","task": "carrying water on a hike", "angle": "how much, and where to refill" }
+]

@@ -1,0 +1,230 @@
+#!/usr/bin/env node
+/**
+ * nightshift — a durable work queue for long unattended agent runs.
+ *
+ * Zero dependencies on purpose: an overnight run should not be able to fail at
+ * 3am because an install went sideways. Node 18+ and nothing else.
+ */
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import process from 'node:process'
+import { report } from '../lib/report.mjs'
+import { STOP_REASONS, done, enqueue, fail, next, start, status, stop } from '../lib/run.mjs'
+
+const USAGE = `nightshift — keep a long unattended run honest.
+
+  nightshift start <run> --until 07:00 [--goal "..."] [--items file] [--freeze f…]
+  nightshift add   <run> --items <file|->      enqueue more work mid-run
+  nightshift next  <run>                       claim the next item (JSON)
+  nightshift done  <run> <id> [--note "..."]
+  nightshift fail  <run> <id> --reason "..." [--requeue]
+  nightshift status <run>
+  nightshift report <run> [--out report.md]
+  nightshift stop  <run> --reason complete|blocked|user [--note "..."]
+  nightshift list
+
+Options
+  --until     6h · 90m · 07:00 · ISO timestamp. The budget is a FLOOR.
+  --items     JSON array, or JSONL, or "-" for stdin. Strings or objects.
+  --freeze    Files the run must treat as fixed. Changing one mid-run marks
+              the batch contaminated instead of letting it silently split.
+  --dir       State directory (default: ./.nightshift, or ~/.nightshift
+              outside a git repo).
+  --json      Machine-readable output.
+
+Every command exits non-zero on error and prints to stderr.`
+
+function parseArgs(argv) {
+  const positional = []
+  const flags = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg.startsWith('--')) {
+      const key = arg.slice(2)
+      const nextArg = argv[i + 1]
+      if (nextArg === undefined || nextArg.startsWith('--')) flags[key] = true
+      else {
+        flags[key] = nextArg
+        i++
+      }
+    } else positional.push(arg)
+  }
+  return { positional, flags }
+}
+
+function stateRoot(flags) {
+  if (flags.dir) return path.resolve(String(flags.dir))
+  // Project-local when there is a project; a run belongs to the work, not the
+  // machine. Falls back to $HOME so `nightshift` still works from anywhere.
+  let dir = process.cwd()
+  while (dir !== path.dirname(dir)) {
+    if (existsSync(path.join(dir, '.git'))) return path.join(dir, '.nightshift')
+    dir = path.dirname(dir)
+  }
+  return path.join(process.env.HOME ?? process.cwd(), '.nightshift')
+}
+
+function readItems(source) {
+  if (!source) return []
+  const raw = source === '-' ? readFileSync(0, 'utf8') : readFileSync(path.resolve(String(source)), 'utf8')
+  const text = raw.trim()
+  if (!text) return []
+  if (text.startsWith('[')) return JSON.parse(text)
+  return text
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => (line.trim().startsWith('{') ? JSON.parse(line) : line.trim()))
+}
+
+const out = (flags, value, human) => {
+  if (flags.json) console.log(JSON.stringify(value, null, 2))
+  else console.log(human ?? JSON.stringify(value, null, 2))
+}
+
+const ms = (value) => {
+  if (value === null || value === undefined) return 'no limit'
+  const mins = Math.round(value / 60_000)
+  return mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`
+}
+
+function main() {
+  const { positional, flags } = parseArgs(process.argv.slice(2))
+  const [command, name, id] = positional
+  if (!command || flags.help || command === 'help') {
+    console.log(USAGE)
+    return
+  }
+  const root = stateRoot(flags)
+  mkdirSync(root, { recursive: true })
+  const now = Date.now()
+
+  switch (command) {
+    case 'start': {
+      if (!name) throw new Error('nightshift start needs a run name.')
+      const freeze = flags.freeze === true ? [] : String(flags.freeze ?? '').split(',').filter(Boolean)
+      const result = start(root, name, {
+        until: flags.until === true ? null : flags.until,
+        goal: flags.goal === true ? null : flags.goal,
+        items: readItems(flags.items === true ? null : flags.items),
+        freeze,
+        now,
+      })
+      out(
+        flags,
+        { run: name, deadline: result.deadline, queued: result.added.length, frozen: freeze },
+        [
+          `Started "${name}".`,
+          `  budget   ${result.deadline ? `until ${new Date(result.deadline).toLocaleString()} (${ms(result.deadline - now)})` : 'no limit — set --until so the run knows what it owes you'}`,
+          `  queued   ${result.added.length} item(s)`,
+          `  frozen   ${freeze.length ? freeze.join(', ') : 'nothing — pass --freeze for anything that must not change mid-run'}`,
+          '',
+          `Claim work with: nightshift next ${name}`,
+        ].join('\n')
+      )
+      return
+    }
+    case 'add': {
+      const items = readItems(flags.items === true ? null : flags.items)
+      const added = enqueue(root, name, items, now)
+      out(flags, { added }, `Queued ${added.length} more item(s) on "${name}".`)
+      return
+    }
+    case 'next': {
+      const result = next(root, name, now)
+      if (flags.json) {
+        console.log(JSON.stringify(result, null, 2))
+        // `idle` is not success — a wrapper script looping on exit code must not
+        // treat "ran out of queued work early" as "finished".
+        process.exitCode = result.state === 'idle' ? 3 : 0
+        return
+      }
+      if (result.state === 'item') {
+        const header = [`[${result.counts.done + 1}/${result.counts.total}] ${result.item.task ?? result.item.id}`]
+        if (result.contaminated) header.push('⚠️  CONTAMINATED — a frozen input changed mid-run. Say so before shipping this batch.')
+        header.push(`id ${result.item.id} · attempt ${result.attempts} · ${ms(result.remainingMs)} left`)
+        console.log(header.join('\n'))
+        console.log(JSON.stringify(result.item, null, 2))
+      } else if (result.state === 'idle') {
+        console.log(`${result.message}\n\n${ms(result.remainingMs)} of budget still unspent.`)
+        process.exitCode = 3
+      } else {
+        console.log(result.message)
+      }
+      return
+    }
+    case 'done': {
+      const result = done(root, name, id, flags.note === true ? null : flags.note, now)
+      out(flags, result, `✓ ${id}`)
+      return
+    }
+    case 'fail': {
+      const result = fail(root, name, id, flags.reason === true ? null : flags.reason, { requeue: Boolean(flags.requeue) }, now)
+      out(flags, result, `✗ ${id} — ${flags.reason}${flags.requeue ? ' (requeued)' : ''}`)
+      return
+    }
+    case 'status': {
+      const result = status(root, name, now)
+      out(
+        flags,
+        result,
+        [
+          `${result.run} — ${result.status}${result.contaminated ? ' ⚠️ CONTAMINATED' : ''}`,
+          result.goal ? `  goal     ${result.goal}` : null,
+          `  progress ${result.counts.done}/${result.counts.total} done · ${result.counts.failed} failed · ${result.counts.pending + result.counts.claimed} left`,
+          `  budget   ${ms(result.remainingMs)} left (ran ${ms(result.elapsedMs)})`,
+          result.drift.length ? `  drift    ${result.drift.map((d) => d.file).join(', ')}` : null,
+        ]
+          .filter(Boolean)
+          .join('\n')
+      )
+      return
+    }
+    case 'report': {
+      const text = report(root, name, now)
+      if (flags.out && flags.out !== true) {
+        writeFileSync(path.resolve(String(flags.out)), text)
+        console.log(`Wrote ${flags.out}`)
+      } else console.log(text)
+      return
+    }
+    case 'stop': {
+      const result = stop(root, name, flags.reason === true ? '' : String(flags.reason ?? ''), flags.note === true ? null : flags.note, now)
+      out(flags, result, `Stopped "${name}" — ${result.reason}.\nRun \`nightshift report ${name}\` for the write-up.`)
+      return
+    }
+    case 'list': {
+      const names = existsSync(root)
+        ? readdirSync(root, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory() && existsSync(path.join(root, entry.name, 'run.json')))
+            .map((entry) => entry.name)
+        : []
+      const runs = names.map((runName) => {
+        const snapshot = status(root, runName, now)
+        return { run: runName, status: snapshot.status, contaminated: snapshot.contaminated, done: snapshot.counts.done, total: snapshot.counts.total, remainingMs: snapshot.remainingMs }
+      })
+      out(
+        flags,
+        { root, runs },
+        runs.length
+          ? runs
+              .map((r) => `${r.run.padEnd(24)} ${r.status.padEnd(8)} ${String(r.done).padStart(3)}/${String(r.total).padEnd(4)} ${ms(r.remainingMs).padStart(9)}${r.contaminated ? '  ⚠️ CONTAMINATED' : ''}`)
+              .join('\n')
+          : `No runs in ${root}.`
+      )
+      return
+    }
+    case 'reasons': {
+      for (const [key, why] of Object.entries(STOP_REASONS)) console.log(`${key.padEnd(9)} ${why}`)
+      return
+    }
+    default:
+      throw new Error(`Unknown command "${command}".\n\n${USAGE}`)
+  }
+}
+
+try {
+  main()
+} catch (error) {
+  console.error(`nightshift: ${error.message}`)
+  process.exitCode = 1
+}

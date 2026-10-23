@@ -1,0 +1,33 @@
+{
+  "name": "nightshift-run",
+  "version": "0.1.0",
+  "description": "A durable work queue that keeps long, unattended AI agent runs honest.",
+  "type": "module",
+  "bin": {
+    "nightshift": "./bin/nightshift"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "references",
+    "SKILL.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "keywords": [
+    "ai-agent",
+    "claude-code",
+    "overnight",
+    "work-queue",
+    "batch",
+    "llm",
+    "agent-skill"
+  ],
+  "scripts": {
+    "test": "node --test"
+  }
+}
