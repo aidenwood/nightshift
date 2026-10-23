@@ -133,6 +133,13 @@ objects.
 State lives in `./.nightshift/<run>/` inside a git repo, `~/.nightshift/<run>/`
 outside one. Override with `--dir`.
 
+**Add `.nightshift/` to the consuming repo's `.gitignore`.** State is an
+append-only log that changes on every claim, so if it is tracked, every
+`nightshift` command dirties the working tree of whichever project the run
+happens to live in — and on a long run that tree is usually one you are also
+committing real work to. The installer cannot do this for you because the
+directory is created in your repo, not this one.
+
 Runs are also registered in `~/.nightshift/runs.json`, so a run started in one
 repo is reachable from anywhere — a long run routinely spans repos, and having
 to `cd` back to wherever it started just to record an item finished somewhere

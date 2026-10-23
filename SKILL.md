@@ -58,6 +58,12 @@ In the morning:
 nightshift report blog-night --out NIGHT.md
 ```
 
+## Before the first run in a repo
+
+Add `.nightshift/` to that repo's `.gitignore`. The state is an append-only log
+that changes on every claim, so tracking it means every command dirties the
+working tree of the project you are also committing real work to.
+
 ## Rules while a run is live
 
 - **Never edit a frozen file.** Queue the correction and apply it between runs.
