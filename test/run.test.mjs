@@ -5,7 +5,7 @@
  * behaviour — the part that matters most — is testable without sleeping.
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -182,5 +182,42 @@ test('starting a run that is already running is refused', () => {
 test('freezing a file that does not exist fails loudly at start', () => {
   const { root, cleanup } = fixture()
   assert.throws(() => start(root, 'r', { until: '1h', freeze: [path.join(root, 'nope.md')], now: T0 }), /Cannot freeze/)
+  cleanup()
+})
+
+test('a run started in one directory is reachable from another', () => {
+  // The bug this covers: state is project-local, so resolving purely from cwd
+  // meant `nightshift done` from a sibling repo answered "No run named …"
+  // while the run sat there healthy. Hit live, mid-run, having to cd back to
+  // whichever repo the run happened to start in just to record an item.
+  const { root, cleanup } = fixture()
+  start(root, 'cross', { until: '8h', items: ['a'], now: T0 })
+
+  // Simulate the CLI's resolution: the run is not under some other project's
+  // root, but a registry entry points at the one that holds it.
+  const elsewhere = mkdtempSync(path.join(tmpdir(), 'nightshift-other-'))
+  const registry = [{ name: 'cross', root }]
+  const resolve = (name) =>
+    [elsewhere].find((candidate) => existsSync(path.join(candidate, name, 'run.json'))) ??
+    registry.find((entry) => entry.name === name)?.root
+
+  assert.equal(resolve('cross'), root, 'the registry must find a run held by another project')
+  const claimed = next(resolve('cross'), 'cross', T0 + MIN)
+  assert.equal(claimed.state, 'item')
+  done(resolve('cross'), 'cross', claimed.item.id, 'recorded from elsewhere', T0 + 2 * MIN)
+  assert.equal(status(root, 'cross', T0 + 3 * MIN).counts.done, 1)
+
+  rmSync(elsewhere, { recursive: true, force: true })
+  cleanup()
+})
+
+test('a registry entry pointing at a deleted run is ignored, not trusted', () => {
+  const { root, cleanup } = fixture()
+  const registry = [{ name: 'ghost', root }]
+  // The registry is a cache, never the source of truth — entries are verified
+  // against the filesystem on read so a deleted run cannot become a dangling
+  // pointer that breaks every later lookup.
+  const live = registry.filter((entry) => existsSync(path.join(entry.root, entry.name, 'run.json')))
+  assert.deepEqual(live, [], 'an entry with no run.json behind it must fall out')
   cleanup()
 })

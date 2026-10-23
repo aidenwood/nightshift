@@ -133,6 +133,13 @@ objects.
 State lives in `./.nightshift/<run>/` inside a git repo, `~/.nightshift/<run>/`
 outside one. Override with `--dir`.
 
+Runs are also registered in `~/.nightshift/runs.json`, so a run started in one
+repo is reachable from anywhere — a long run routinely spans repos, and having
+to `cd` back to wherever it started just to record an item finished somewhere
+else is friction that shows up at 3am. The registry is a cache, never the
+source of truth: entries are verified against the filesystem on read, so a
+deleted run falls out instead of becoming a dangling pointer.
+
 ## A worked loop
 
 ```bash

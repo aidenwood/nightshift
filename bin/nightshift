@@ -52,16 +52,65 @@ function parseArgs(argv) {
   return { positional, flags }
 }
 
-function stateRoot(flags) {
-  if (flags.dir) return path.resolve(String(flags.dir))
-  // Project-local when there is a project; a run belongs to the work, not the
-  // machine. Falls back to $HOME so `nightshift` still works from anywhere.
+function homeRoot() {
+  return path.join(process.env.HOME ?? process.cwd(), '.nightshift')
+}
+
+function projectRoot() {
   let dir = process.cwd()
   while (dir !== path.dirname(dir)) {
     if (existsSync(path.join(dir, '.git'))) return path.join(dir, '.nightshift')
     dir = path.dirname(dir)
   }
-  return path.join(process.env.HOME ?? process.cwd(), '.nightshift')
+  return null
+}
+
+const REGISTRY = () => path.join(homeRoot(), 'runs.json')
+
+/**
+ * Name → state root, so a run is reachable from anywhere on the machine.
+ *
+ * State stays project-local — a run belongs to the work, not the box — but a
+ * run routinely spans repos, and resolving purely from `cwd` meant
+ * `nightshift done` from a sibling repo answered "No run named …" while the run
+ * sat there perfectly healthy. Found that the hard way mid-run, having to
+ * `cd` back to the repo the run happened to be started in just to record an
+ * item finished somewhere else.
+ *
+ * The registry is a cache, never the source of truth: entries are verified
+ * against the filesystem on read, so a deleted or moved run falls out of it
+ * instead of becoming a dangling pointer.
+ */
+function readRegistry() {
+  try {
+    const entries = JSON.parse(readFileSync(REGISTRY(), 'utf8'))
+    return entries.filter((entry) => existsSync(path.join(entry.root, entry.name, 'run.json')))
+  } catch {
+    return []
+  }
+}
+
+function registerRun(name, root) {
+  const entries = readRegistry().filter((entry) => entry.name !== name)
+  entries.push({ name, root })
+  mkdirSync(homeRoot(), { recursive: true })
+  writeFileSync(REGISTRY(), `${JSON.stringify(entries, null, 2)}\n`)
+}
+
+function stateRoot(flags, name, { creating = false } = {}) {
+  if (flags.dir) return path.resolve(String(flags.dir))
+  const project = projectRoot()
+  const home = homeRoot()
+  if (creating || !name) return project ?? home
+  const direct = [project, home].filter(Boolean).find((root) => existsSync(path.join(root, name, 'run.json')))
+  if (direct) return direct
+  const registered = readRegistry().find((entry) => entry.name === name)
+  return registered?.root ?? project ?? home
+}
+
+function knownRoots(flags, root) {
+  if (flags.dir) return [root]
+  return [...new Set([projectRoot(), homeRoot(), ...readRegistry().map((entry) => entry.root)].filter(Boolean))]
 }
 
 function readItems(source) {
@@ -94,7 +143,7 @@ function main() {
     console.log(USAGE)
     return
   }
-  const root = stateRoot(flags)
+  const root = stateRoot(flags, name, { creating: command === 'start' })
   mkdirSync(root, { recursive: true })
   const now = Date.now()
 
@@ -109,6 +158,7 @@ function main() {
         freeze,
         now,
       })
+      registerRun(name, root)
       out(
         flags,
         { run: name, deadline: result.deadline, queued: result.added.length, frozen: freeze },
@@ -193,23 +243,25 @@ function main() {
       return
     }
     case 'list': {
-      const names = existsSync(root)
-        ? readdirSync(root, { withFileTypes: true })
-            .filter((entry) => entry.isDirectory() && existsSync(path.join(root, entry.name, 'run.json')))
-            .map((entry) => entry.name)
-        : []
-      const runs = names.map((runName) => {
-        const snapshot = status(root, runName, now)
-        return { run: runName, status: snapshot.status, contaminated: snapshot.contaminated, done: snapshot.counts.done, total: snapshot.counts.total, remainingMs: snapshot.remainingMs }
-      })
+      // Both roots, deduped: a `list` that only showed the project's runs would
+      // hide exactly the cross-repo runs that are hardest to find by hand.
+      const roots = knownRoots(flags, root)
+      const runs = roots.flatMap((runRoot) =>
+        (existsSync(runRoot) ? readdirSync(runRoot, { withFileTypes: true }) : [])
+          .filter((entry) => entry.isDirectory() && existsSync(path.join(runRoot, entry.name, 'run.json')))
+          .map((entry) => {
+            const snapshot = status(runRoot, entry.name, now)
+            return { run: entry.name, root: runRoot, status: snapshot.status, contaminated: snapshot.contaminated, done: snapshot.counts.done, total: snapshot.counts.total, remainingMs: snapshot.remainingMs }
+          })
+      )
       out(
         flags,
-        { root, runs },
+        { roots: knownRoots(flags, root), runs },
         runs.length
           ? runs
               .map((r) => `${r.run.padEnd(24)} ${r.status.padEnd(8)} ${String(r.done).padStart(3)}/${String(r.total).padEnd(4)} ${ms(r.remainingMs).padStart(9)}${r.contaminated ? '  ⚠️ CONTAMINATED' : ''}`)
               .join('\n')
-          : `No runs in ${root}.`
+          : 'No runs found.'
       )
       return
     }
